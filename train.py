@@ -39,6 +39,7 @@ from utils import (clip_grad_norm_, create_logger, update_ema,
                    get_experiment_dir, text_preprocessing)
 import numpy as np
 from transformers import T5EncoderModel, T5Tokenizer
+from diffusers.models.attention_processor import FusedAttnProcessor2_0
 
 #################################################################################
 #                                  Training Loop                                #
@@ -125,7 +126,28 @@ def main(args):
     model = DDP(model.to(device), device_ids=[local_rank])
 
     logger.info(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    # opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+
+    # Freeze all model parameters
+    for param in model.parameters():
+        param.requires_grad = False
+        
+    # Enable gradient for only the new projection layer in attention processors
+    for name, module in model.named_modules():
+        if isinstance(module, FusedAttnProcessor2_0):
+            if module.clip_pose_projection is not None:
+                for param in module.clip_pose_projection.parameters():
+                    param.requires_grad = True
+    
+    # Modify optimizer to only include projection layer parameters
+    trainable_params = []
+    for name, module in model.named_modules():
+        if isinstance(module, FusedAttnProcessor2_0):
+            if module.clip_pose_projection is not None:
+                trainable_params.extend(module.clip_pose_projection.parameters())
+    
+    # Update optimizer to only train the projection layer
+    opt = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=0)
 
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
@@ -259,16 +281,31 @@ def main(args):
             # Save Latte checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
+                    projection_state = {}
+                    for name, module in model.named_modules():
+                        if isinstance(module, FusedAttnProcessor2_0):
+                            if module.clip_pose_projection is not None:
+                                projection_state[name] = module.clip_pose_projection.state_dict()
+                    
                     checkpoint = {
                         "model": model.module.state_dict(),
                         "ema": ema.state_dict(),
                         # "opt": opt.state_dict(),
                         # "args": args
+                        "projection_layers": projection_state
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                 dist.barrier()
+
+            if args.resume_from_checkpoint:
+                checkpoint = torch.load(checkpoint_path)
+                if "projection_layers" in checkpoint:
+                    for name, module in model.named_modules():
+                        if isinstance(module, FusedAttnProcessor2_0):
+                            if module.clip_pose_projection is not None and name in checkpoint["projection_layers"]:
+                                module.clip_pose_projection.load_state_dict(checkpoint["projection_layers"][name])
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
